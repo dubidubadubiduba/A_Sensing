@@ -144,29 +144,36 @@ def split_new(report_sections: list[dict], seen: dict) -> tuple[list[dict], list
     return new_sections, new_links
 
 
-def render_sections(report_sections: list[dict]) -> str:
-    parts = []
-    for section in report_sections:
-        parts.append(f"<h3>{section['title']}</h3>")
-        if not section["items"]:
-            parts.append("<p style='color:#888'>소식 없음</p>")
-            continue
-        parts.append("<ul>")
-        for item in section["items"]:
-            title_ko = item.get("title_ko")
-            ko_line = f"<br><span style='color:#555'>→ {title_ko}</span>" if title_ko else ""
-            parts.append(
-                f"<li><a href=\"{item['link']}\">{item['title']}</a>"
-                f"{ko_line}"
-                f" <span style='color:#888'>- {item['source']}</span></li>"
-            )
-        parts.append("</ul>")
-    parts.append("<h3>⑥ DRAM 공급사 영향도 분석</h3>")
-    parts.append(
+def render_section_block(section: dict) -> str:
+    parts = [f"<h3>{section['title']}</h3>"]
+    if not section["items"]:
+        parts.append("<p style='color:#888'>소식 없음</p>")
+        return "\n".join(parts)
+    parts.append("<ul>")
+    for item in section["items"]:
+        title_ko = item.get("title_ko")
+        ko_line = f"<br><span style='color:#555'>→ {title_ko}</span>" if title_ko else ""
+        parts.append(
+            f"<li><a href=\"{item['link']}\">{item['title']}</a>"
+            f"{ko_line}"
+            f" <span style='color:#888'>- {item['source']}</span></li>"
+        )
+    parts.append("</ul>")
+    return "\n".join(parts)
+
+
+def render_impact_block() -> str:
+    return (
+        "<h3>⑥ DRAM 공급사 영향도 분석</h3>\n"
         "<p style='color:#888'>(수동 작성 영역) 위 헤드라인을 검토하고 "
         "수요/가격/경쟁 포지셔닝/대응 제안을 직접 정리하세요.</p>"
     )
-    return "\n".join(parts)
+
+
+def render_sections(report_sections: list[dict]) -> str:
+    blocks = [render_section_block(section) for section in report_sections]
+    blocks.append(render_impact_block())
+    return "\n".join(blocks)
 
 
 def render_email_html(new_sections: list[dict]) -> str:
@@ -176,7 +183,17 @@ def render_email_html(new_sections: list[dict]) -> str:
 
 def render_page_html(full_sections: list[dict]) -> str:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    body = render_sections(full_sections)
+
+    blocks = [render_section_block(section) for section in full_sections]
+    blocks.append(render_impact_block())
+
+    rows = []
+    for i in range(0, len(blocks), 2):
+        pair = blocks[i : i + 2]
+        cols = "\n".join(f'<div class="col">{block}</div>' for block in pair)
+        rows.append(f'<div class="pair-row">{cols}</div>')
+    body = "\n".join(rows)
+
     return f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -184,15 +201,19 @@ def render_page_html(full_sections: list[dict]) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Apple Sensing Digest</title>
 <style>
-  body {{ font-family: -apple-system, Segoe UI, Malgun Gothic, sans-serif; max-width: 800px;
+  body {{ font-family: -apple-system, Segoe UI, Malgun Gothic, sans-serif; max-width: 1100px;
          margin: 2rem auto; padding: 0 1rem; line-height: 1.6; color: #1a1a1a; }}
   h1 {{ font-size: 1.4rem; }}
-  h3 {{ margin-top: 2rem; border-bottom: 2px solid #eee; padding-bottom: 0.3rem; }}
+  h3 {{ margin-top: 0; border-bottom: 2px solid #eee; padding-bottom: 0.3rem; }}
   ul {{ padding-left: 1.2rem; }}
   li {{ margin-bottom: 0.4rem; }}
   a {{ color: #0066cc; text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
   .updated {{ color: #888; font-size: 0.9rem; }}
+  .pair-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 2.5rem; margin-top: 2rem; }}
+  @media (max-width: 700px) {{
+    .pair-row {{ grid-template-columns: 1fr; gap: 0; }}
+  }}
 </style>
 </head>
 <body>
