@@ -178,14 +178,11 @@ def render_section_block(section: dict) -> str:
         title_ko = item.get("title_ko")
         title_ko_line = f"<br><span style='color:#555'>→ {title_ko}</span>" if title_ko else ""
 
-        summary = item.get("summary")
         summary_ko = item.get("summary_ko")
         summary_html = ""
-        if summary:
-            summary_html += f"<div style='color:#666;font-size:0.9rem;margin-top:0.2rem'>{summary}</div>"
         if summary_ko:
-            summary_html += (
-                f"<div style='color:#888;font-size:0.9rem;font-style:italic'>→ {summary_ko}</div>"
+            summary_html = (
+                f"<div style='color:#666;font-size:0.9rem;margin-top:0.2rem'>{summary_ko}</div>"
             )
 
         parts.append(
