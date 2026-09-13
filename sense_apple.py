@@ -23,6 +23,8 @@ BASE_DIR = Path(__file__).parent
 SECRETS_PATH = BASE_DIR / "secrets.json"
 SEEN_PATH = BASE_DIR / "data" / "seen_links.json"
 PREVIEW_PATH = BASE_DIR / "data" / "preview.html"
+DOCS_DIR = BASE_DIR / "docs"
+PAGE_PATH = DOCS_DIR / "index.html"
 
 FETCH_TIMEOUT_DAYS_KEEP_SEEN = 30
 
@@ -82,9 +84,9 @@ def fetch_source(kind: str, name: str, url_or_query: str) -> list[dict]:
     return items
 
 
-def collect_report(seen: dict) -> tuple[list[dict], list[str]]:
+def collect_all() -> list[dict]:
+    """Fetch every source once. Returns the FULL current picture (not deduped)."""
     report_sections = []
-    new_links = []
     for section in SECTIONS:
         section_items = []
         for kind, name, query in section["sources"]:
@@ -93,22 +95,28 @@ def collect_report(seen: dict) -> tuple[list[dict], list[str]]:
             except Exception as exc:  # noqa: BLE001
                 print(f"[경고] {name} 수집 실패: {exc}")
                 continue
-            for item in items:
-                if item["link"] in seen:
-                    continue
-                section_items.append(item)
-                new_links.append(item["link"])
+            section_items.extend(items)
         report_sections.append({"title": section["title"], "items": section_items})
-    return report_sections, new_links
+    return report_sections
 
 
-def render_html(report_sections: list[dict]) -> str:
-    today = dt.date.today().isoformat()
-    parts = [f"<h2>[Apple Sensing] {today} 요약</h2>"]
+def split_new(report_sections: list[dict], seen: dict) -> tuple[list[dict], list[str]]:
+    """Return a copy of report_sections containing only links not in `seen`."""
+    new_sections = []
+    new_links = []
+    for section in report_sections:
+        new_items = [item for item in section["items"] if item["link"] not in seen]
+        new_links.extend(item["link"] for item in new_items)
+        new_sections.append({"title": section["title"], "items": new_items})
+    return new_sections, new_links
+
+
+def render_sections(report_sections: list[dict]) -> str:
+    parts = []
     for section in report_sections:
         parts.append(f"<h3>{section['title']}</h3>")
         if not section["items"]:
-            parts.append("<p style='color:#888'>새 소식 없음</p>")
+            parts.append("<p style='color:#888'>소식 없음</p>")
             continue
         parts.append("<ul>")
         for item in section["items"]:
@@ -125,6 +133,41 @@ def render_html(report_sections: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def render_email_html(new_sections: list[dict]) -> str:
+    today = dt.date.today().isoformat()
+    return f"<h2>[Apple Sensing] {today} 신규 소식 요약</h2>\n" + render_sections(new_sections)
+
+
+def render_page_html(full_sections: list[dict]) -> str:
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    body = render_sections(full_sections)
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apple Sensing Digest</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Malgun Gothic, sans-serif; max-width: 800px;
+         margin: 2rem auto; padding: 0 1rem; line-height: 1.6; color: #1a1a1a; }}
+  h1 {{ font-size: 1.4rem; }}
+  h3 {{ margin-top: 2rem; border-bottom: 2px solid #eee; padding-bottom: 0.3rem; }}
+  ul {{ padding-left: 1.2rem; }}
+  li {{ margin-bottom: 0.4rem; }}
+  a {{ color: #0066cc; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .updated {{ color: #888; font-size: 0.9rem; }}
+</style>
+</head>
+<body>
+  <h1>Apple Sensing Digest</h1>
+  <p class="updated">마지막 업데이트: {now}</p>
+  {body}
+</body>
+</html>
+"""
+
+
 def send_email(secrets: dict, html_body: str):
     today = dt.date.today().isoformat()
     msg = MIMEText(html_body, "html", "utf-8")
@@ -139,28 +182,33 @@ def send_email(secrets: dict, html_body: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="메일 발송 없이 미리보기만 생성")
+    parser.add_argument("--dry-run", action="store_true", help="메일 발송 없이 미리보기/공개 페이지만 생성")
     args = parser.parse_args()
 
     seen = load_seen()
-    report_sections, new_links = collect_report(seen)
-    html_body = render_html(report_sections)
+    full_sections = collect_all()
+    new_sections, new_links = split_new(full_sections, seen)
 
-    total_items = sum(len(s["items"]) for s in report_sections)
-    print(f"수집된 새 항목: {total_items}건")
+    # 공개 페이지(docs/index.html)는 항상 "현재 시점의 전체 최신 소식"을 보여준다.
+    DOCS_DIR.mkdir(exist_ok=True)
+    PAGE_PATH.write_text(render_page_html(full_sections), encoding="utf-8")
+    print(f"공개 페이지 갱신: {PAGE_PATH}")
+
+    total_new = sum(len(s["items"]) for s in new_sections)
+    print(f"수집된 새 항목(이메일 대상): {total_new}건")
 
     if args.dry_run:
         PREVIEW_PATH.parent.mkdir(exist_ok=True)
-        PREVIEW_PATH.write_text(html_body, encoding="utf-8")
+        PREVIEW_PATH.write_text(render_email_html(new_sections), encoding="utf-8")
         print(f"드라이런 모드: 이메일을 보내지 않았습니다. 미리보기 저장 위치: {PREVIEW_PATH}")
         return
 
-    if total_items == 0:
+    if total_new == 0:
         print("새 항목이 없어 메일을 보내지 않았습니다.")
         return
 
     secrets = load_secrets()
-    send_email(secrets, html_body)
+    send_email(secrets, render_email_html(new_sections))
 
     now = time.time()
     for link in new_links:
