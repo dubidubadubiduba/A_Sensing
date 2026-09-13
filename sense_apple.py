@@ -16,6 +16,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import feedparser
+from deep_translator import MyMemoryTranslator
 
 from sources import MAX_AGE_DAYS, MAX_ITEMS_PER_SOURCE, SECTIONS
 
@@ -25,8 +26,10 @@ SEEN_PATH = BASE_DIR / "data" / "seen_links.json"
 PREVIEW_PATH = BASE_DIR / "data" / "preview.html"
 DOCS_DIR = BASE_DIR / "docs"
 PAGE_PATH = DOCS_DIR / "index.html"
+TRANSLATION_CACHE_PATH = BASE_DIR / "data" / "translations.json"
 
 FETCH_TIMEOUT_DAYS_KEEP_SEEN = 30
+TRANSLATE_DELAY_SECONDS = 0.3
 
 
 def load_secrets():
@@ -50,6 +53,36 @@ def save_seen(seen: dict):
     cutoff = time.time() - FETCH_TIMEOUT_DAYS_KEEP_SEEN * 86400
     trimmed = {url: ts for url, ts in seen.items() if ts >= cutoff}
     SEEN_PATH.write_text(json.dumps(trimmed, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_translation_cache() -> dict:
+    if not TRANSLATION_CACHE_PATH.exists():
+        return {}
+    return json.loads(TRANSLATION_CACHE_PATH.read_text(encoding="utf-8"))
+
+
+def save_translation_cache(cache: dict):
+    TRANSLATION_CACHE_PATH.parent.mkdir(exist_ok=True)
+    TRANSLATION_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def translate_sections(report_sections: list[dict], cache: dict):
+    """Mutates items in place, adding item['title_ko']. Uses/updates the cache."""
+    translator = MyMemoryTranslator(source="en-US", target="ko-KR")
+    for section in report_sections:
+        for item in section["items"]:
+            title = item["title"]
+            if title in cache:
+                item["title_ko"] = cache[title]
+                continue
+            try:
+                translated = translator.translate(title)
+                time.sleep(TRANSLATE_DELAY_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[경고] 번역 실패: {title[:40]}... ({exc})")
+                translated = None
+            cache[title] = translated
+            item["title_ko"] = translated
 
 
 def entry_timestamp(entry) -> float | None:
@@ -120,9 +153,12 @@ def render_sections(report_sections: list[dict]) -> str:
             continue
         parts.append("<ul>")
         for item in section["items"]:
+            title_ko = item.get("title_ko")
+            ko_line = f"<br><span style='color:#555'>→ {title_ko}</span>" if title_ko else ""
             parts.append(
-                f"<li><a href=\"{item['link']}\">{item['title']}</a> "
-                f"<span style='color:#888'>- {item['source']}</span></li>"
+                f"<li><a href=\"{item['link']}\">{item['title']}</a>"
+                f"{ko_line}"
+                f" <span style='color:#888'>- {item['source']}</span></li>"
             )
         parts.append("</ul>")
     parts.append("<h3>⑥ DRAM 공급사 영향도 분석</h3>")
@@ -168,12 +204,19 @@ def render_page_html(full_sections: list[dict]) -> str:
 """
 
 
+def recipient_list(secrets: dict) -> list[str]:
+    if "recipient_emails" in secrets:
+        return secrets["recipient_emails"]
+    # backward compatibility with the older single-recipient field
+    return [secrets.get("recipient_email", secrets["sender_email"])]
+
+
 def send_email(secrets: dict, html_body: str):
     today = dt.date.today().isoformat()
     msg = MIMEText(html_body, "html", "utf-8")
     msg["Subject"] = f"[Apple Sensing] {today} 요약"
     msg["From"] = secrets["sender_email"]
-    msg["To"] = secrets.get("recipient_email", secrets["sender_email"])
+    msg["To"] = ", ".join(recipient_list(secrets))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(secrets["sender_email"], secrets["app_password"])
@@ -187,6 +230,11 @@ def main():
 
     seen = load_seen()
     full_sections = collect_all()
+
+    translation_cache = load_translation_cache()
+    translate_sections(full_sections, translation_cache)
+    save_translation_cache(translation_cache)
+
     new_sections, new_links = split_new(full_sections, seen)
 
     # 공개 페이지(docs/index.html)는 항상 "현재 시점의 전체 최신 소식"을 보여준다.
