@@ -8,7 +8,9 @@ Usage:
 import argparse
 import calendar
 import datetime as dt
+import html
 import json
+import re
 import smtplib
 import sys
 import time
@@ -66,23 +68,28 @@ def save_translation_cache(cache: dict):
     TRANSLATION_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def translate_text(text: str, translator, cache: dict) -> str | None:
+    if not text:
+        return None
+    if text in cache:
+        return cache[text]
+    try:
+        translated = translator.translate(text)
+        time.sleep(TRANSLATE_DELAY_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[경고] 번역 실패: {text[:40]}... ({exc})")
+        translated = None
+    cache[text] = translated
+    return translated
+
+
 def translate_sections(report_sections: list[dict], cache: dict):
-    """Mutates items in place, adding item['title_ko']. Uses/updates the cache."""
+    """Mutates items in place, adding item['title_ko'] / item['summary_ko']."""
     translator = MyMemoryTranslator(source="en-US", target="ko-KR")
     for section in report_sections:
         for item in section["items"]:
-            title = item["title"]
-            if title in cache:
-                item["title_ko"] = cache[title]
-                continue
-            try:
-                translated = translator.translate(title)
-                time.sleep(TRANSLATE_DELAY_SECONDS)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[경고] 번역 실패: {title[:40]}... ({exc})")
-                translated = None
-            cache[title] = translated
-            item["title_ko"] = translated
+            item["title_ko"] = translate_text(item["title"], translator, cache)
+            item["summary_ko"] = translate_text(item.get("summary", ""), translator, cache)
 
 
 def entry_timestamp(entry) -> float | None:
@@ -91,6 +98,19 @@ def entry_timestamp(entry) -> float | None:
         if value:
             return calendar.timegm(value)
     return None
+
+
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+SUMMARY_MAX_CHARS = 220
+
+
+def clean_summary(raw_html: str) -> str:
+    text = HTML_TAG_RE.sub(" ", raw_html or "")
+    text = html.unescape(text)
+    text = " ".join(text.split())
+    if len(text) > SUMMARY_MAX_CHARS:
+        text = text[:SUMMARY_MAX_CHARS].rsplit(" ", 1)[0] + "..."
+    return text
 
 
 def fetch_source(kind: str, name: str, url_or_query: str) -> list[dict]:
@@ -104,10 +124,14 @@ def fetch_source(kind: str, name: str, url_or_query: str) -> list[dict]:
         ts = entry_timestamp(entry)
         if ts is not None and ts < cutoff:
             continue
+        # Google News' "summary" field is just the title re-wrapped in a link, not real
+        # article content, so only direct RSS feeds get a translated summary.
+        summary = clean_summary(entry.get("summary", "")) if kind == "rss" else ""
         items.append(
             {
                 "source": name,
                 "title": entry.get("title", "(제목 없음)"),
+                "summary": summary,
                 "link": entry.get("link", ""),
                 "timestamp": ts,
             }
@@ -152,10 +176,22 @@ def render_section_block(section: dict) -> str:
     parts.append("<ul>")
     for item in section["items"]:
         title_ko = item.get("title_ko")
-        ko_line = f"<br><span style='color:#555'>→ {title_ko}</span>" if title_ko else ""
+        title_ko_line = f"<br><span style='color:#555'>→ {title_ko}</span>" if title_ko else ""
+
+        summary = item.get("summary")
+        summary_ko = item.get("summary_ko")
+        summary_html = ""
+        if summary:
+            summary_html += f"<div style='color:#666;font-size:0.9rem;margin-top:0.2rem'>{summary}</div>"
+        if summary_ko:
+            summary_html += (
+                f"<div style='color:#888;font-size:0.9rem;font-style:italic'>→ {summary_ko}</div>"
+            )
+
         parts.append(
             f"<li><a href=\"{item['link']}\">{item['title']}</a>"
-            f"{ko_line}"
+            f"{title_ko_line}"
+            f"{summary_html}"
             f" <span style='color:#888'>- {item['source']}</span></li>"
         )
     parts.append("</ul>")
