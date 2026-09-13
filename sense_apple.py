@@ -17,6 +17,7 @@ import time
 from email.mime.text import MIMEText
 from pathlib import Path
 
+import anthropic
 import feedparser
 from deep_translator import MyMemoryTranslator
 
@@ -34,14 +35,19 @@ FETCH_TIMEOUT_DAYS_KEEP_SEEN = 30
 TRANSLATE_DELAY_SECONDS = 0.3
 
 
-def load_secrets():
+def load_secrets() -> dict:
     if not SECRETS_PATH.exists():
+        return {}
+    return json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
+
+
+def require_email_secrets(secrets: dict):
+    if not secrets.get("sender_email") or not secrets.get("app_password"):
         print(
-            "secrets.json이 없습니다. secrets.example.json을 secrets.json으로 복사한 뒤 "
-            "본인 Gmail 주소/앱 비밀번호를 채워주세요."
+            "secrets.json에 sender_email/app_password가 없습니다. secrets.example.json을 "
+            "secrets.json으로 복사한 뒤 본인 Gmail 주소/앱 비밀번호를 채워주세요."
         )
         sys.exit(1)
-    return json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
 
 
 def load_seen() -> dict:
@@ -195,30 +201,84 @@ def render_section_block(section: dict) -> str:
     return "\n".join(parts)
 
 
-def render_impact_block() -> str:
+IMPACT_MODEL = "claude-sonnet-5"
+IMPACT_SYSTEM_PROMPT = (
+    "당신은 삼성전자 메모리사업부(D램/낸드 공급사)의 Competitive Intelligence 분석가입니다. "
+    "아래에 오늘 수집된 애플 및 관련 업계 뉴스 헤드라인이 섹션별로 정리되어 있습니다. "
+    "이 뉴스들을 종합하여 D램 공급사 관점의 영향도 분석을 작성하세요.\n\n"
+    "반드시 아래 4개 항목으로만 구성하고, 각 항목은 1~2문장으로 간결하게 한국어로 작성하세요:\n"
+    "1. 수요 영향\n2. 가격 영향\n3. 경쟁 포지셔닝\n4. 대응 제안\n\n"
+    "오늘 뉴스에 실제로 근거가 있는 내용만 작성하고, 관련성 있는 뉴스가 부족한 항목은 "
+    "'오늘 뉴스에서는 특별한 시사점 없음'이라고 솔직하게 쓰세요. 과장하거나 추측성 정보를 "
+    "지어내지 마세요.\n\n"
+    "출력 형식: 마크다운 기호(#, **, -, * 등)를 절대 쓰지 말고 순수 텍스트로만 작성하세요. "
+    "제목이나 인사말 없이 바로 '1. 수요 영향: ...' 형식으로 시작해서 4개 항목을 줄바꿈으로 구분하세요."
+)
+
+
+def build_impact_prompt(full_sections: list[dict]) -> str:
+    lines = []
+    for section in full_sections:
+        lines.append(f"[{section['title']}]")
+        if not section["items"]:
+            lines.append("- (수집된 뉴스 없음)")
+        for item in section["items"]:
+            line = f"- {item['title']} ({item['source']})"
+            if item.get("summary"):
+                line += f": {item['summary']}"
+            lines.append(line)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def generate_impact_analysis(full_sections: list[dict], api_key: str | None) -> str | None:
+    if not api_key:
+        return None
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=IMPACT_MODEL,
+            max_tokens=1200,
+            thinking={"type": "disabled"},
+            system=IMPACT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": build_impact_prompt(full_sections)}],
+        )
+        text = "".join(block.text for block in response.content if block.type == "text")
+        return text.strip() or None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[경고] 영향도 분석 생성 실패: {exc}")
+        return None
+
+
+def render_impact_block(analysis_text: str | None) -> str:
+    if analysis_text:
+        body = html.escape(analysis_text).replace("\n", "<br>")
+        return f"<h3>⑥ DRAM 공급사 영향도 분석</h3>\n<div style='line-height:1.7'>{body}</div>"
     return (
         "<h3>⑥ DRAM 공급사 영향도 분석</h3>\n"
-        "<p style='color:#888'>(수동 작성 영역) 위 헤드라인을 검토하고 "
+        "<p style='color:#888'>(자동 생성 실패 - 수동 작성 영역) 위 헤드라인을 검토하고 "
         "수요/가격/경쟁 포지셔닝/대응 제안을 직접 정리하세요.</p>"
     )
 
 
-def render_sections(report_sections: list[dict]) -> str:
+def render_sections(report_sections: list[dict], analysis_text: str | None = None) -> str:
     blocks = [render_section_block(section) for section in report_sections]
-    blocks.append(render_impact_block())
+    blocks.append(render_impact_block(analysis_text))
     return "\n".join(blocks)
 
 
-def render_email_html(new_sections: list[dict]) -> str:
+def render_email_html(new_sections: list[dict], analysis_text: str | None = None) -> str:
     today = dt.date.today().isoformat()
-    return f"<h2>[Apple Sensing] {today} 신규 소식 요약</h2>\n" + render_sections(new_sections)
+    return f"<h2>[Apple Sensing] {today} 신규 소식 요약</h2>\n" + render_sections(
+        new_sections, analysis_text
+    )
 
 
-def render_page_html(full_sections: list[dict]) -> str:
+def render_page_html(full_sections: list[dict], analysis_text: str | None = None) -> str:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     blocks = [render_section_block(section) for section in full_sections]
-    blocks.append(render_impact_block())
+    blocks.append(render_impact_block(analysis_text))
 
     rows = []
     for i in range(0, len(blocks), 2):
@@ -282,6 +342,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="메일 발송 없이 미리보기/공개 페이지만 생성")
     args = parser.parse_args()
 
+    secrets = load_secrets()
+
     seen = load_seen()
     full_sections = collect_all()
 
@@ -289,11 +351,13 @@ def main():
     translate_sections(full_sections, translation_cache)
     save_translation_cache(translation_cache)
 
+    analysis_text = generate_impact_analysis(full_sections, secrets.get("anthropic_api_key"))
+
     new_sections, new_links = split_new(full_sections, seen)
 
     # 공개 페이지(docs/index.html)는 항상 "현재 시점의 전체 최신 소식"을 보여준다.
     DOCS_DIR.mkdir(exist_ok=True)
-    PAGE_PATH.write_text(render_page_html(full_sections), encoding="utf-8")
+    PAGE_PATH.write_text(render_page_html(full_sections, analysis_text), encoding="utf-8")
     print(f"공개 페이지 갱신: {PAGE_PATH}")
 
     total_new = sum(len(s["items"]) for s in new_sections)
@@ -301,7 +365,7 @@ def main():
 
     if args.dry_run:
         PREVIEW_PATH.parent.mkdir(exist_ok=True)
-        PREVIEW_PATH.write_text(render_email_html(new_sections), encoding="utf-8")
+        PREVIEW_PATH.write_text(render_email_html(new_sections, analysis_text), encoding="utf-8")
         print(f"드라이런 모드: 이메일을 보내지 않았습니다. 미리보기 저장 위치: {PREVIEW_PATH}")
         return
 
@@ -309,8 +373,8 @@ def main():
         print("새 항목이 없어 메일을 보내지 않았습니다.")
         return
 
-    secrets = load_secrets()
-    send_email(secrets, render_email_html(new_sections))
+    require_email_secrets(secrets)
+    send_email(secrets, render_email_html(new_sections, analysis_text))
 
     now = time.time()
     for link in new_links:
